@@ -916,7 +916,7 @@ impl renderer::Headless for Renderer {
                 label: Some("iced_wgpu [headless]"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_bind_groups: 2,
+                    max_bind_groups: 4,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
