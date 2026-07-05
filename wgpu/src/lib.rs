@@ -914,7 +914,16 @@ impl renderer::Headless for Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("iced_wgpu [headless]"),
-                required_features: wgpu::Features::empty(),
+                // Allow embedded renderers 8x MSAA on adapter-specific formats
+                // (e.g. Rgba16Float) when the adapter supports the feature.
+                required_features: if adapter
+                    .features()
+                    .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+                {
+                    wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits: wgpu::Limits {
                     max_bind_groups: 4,
                     ..wgpu::Limits::default()

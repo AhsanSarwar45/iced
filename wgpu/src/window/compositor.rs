@@ -164,12 +164,20 @@ impl Compositor {
             ..limits
         });
 
-        // Request SHADER_F16 only if the adapter supports it (e.g., not available in WebGL2)
-        let required_features = if adapter.features().contains(wgpu::Features::SHADER_F16) {
-            wgpu::Features::SHADER_F16
-        } else {
-            wgpu::Features::empty()
-        };
+        // Request adapter features only if supported (WebGL2 lacks these).
+        // SHADER_F16: iced's own use. TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES:
+        // lets an embedded renderer (shader widget) use 8x MSAA on
+        // adapter-specific formats such as the Rgba16Float HDR target.
+        let mut required_features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::SHADER_F16) {
+            required_features |= wgpu::Features::SHADER_F16;
+        }
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+        {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
 
         let mut errors = Vec::new();
 
