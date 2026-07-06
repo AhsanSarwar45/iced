@@ -22,7 +22,14 @@ all-features = true
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["wgpu", "tiny-skia", "crisp", "hinting", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland"]
+# NOTE (corsetta fork): `web-colors` removed from defaults. It forces
+# GAMMA_CORRECTION=false, which makes the compositor pick a NON-sRGB surface;
+# our wgpu renderer outputs linear color and relies on the hardware sRGB
+# swapchain encode (see temporal_present.wgsl), so a non-sRGB surface renders
+# the whole scene ~2x too dark. Leaving it off keeps GAMMA_CORRECTION=true so an
+# sRGB surface is selected. Only relevant for browser color-matching, which this
+# native app doesn't need.
+default = ["wgpu", "tiny-skia", "crisp", "hinting", "thread-pool", "linux-theme-detection", "x11", "wayland"]
 # Enables the `wgpu` GPU-accelerated renderer with all its default features (Vulkan, Metal, DX12, OpenGL, and WebGPU)
 wgpu = ["wgpu-bare", "iced_renderer/wgpu"]
 # Enables the `wgpu` GPU-accelerated renderer with the minimum required features (no backends!)

@@ -32,6 +32,7 @@ pub mod geometry;
 mod buffer;
 mod color;
 mod engine;
+mod frame_timer;
 mod quad;
 mod text;
 mod triangle;
@@ -53,8 +54,11 @@ pub use iced_graphics::core;
 pub use wgpu;
 
 pub use engine::Engine;
+pub use frame_timer::last_ui_gpu_ms;
 pub use layer::Layer;
 pub use primitive::Primitive;
+
+use frame_timer::FrameTimer;
 
 #[cfg(feature = "geometry")]
 pub use geometry::Geometry;
@@ -89,6 +93,12 @@ pub struct Renderer {
     image_cache: std::cell::RefCell<image::Cache>,
 
     staging_belt: wgpu::util::StagingBelt,
+
+    /// Whole-frame GPU timer (patch, see [`frame_timer`]): `None` until the first
+    /// `draw` probes for `TIMESTAMP_QUERY`, then `Some` when supported. Publishes
+    /// UI-render cost to [`last_ui_gpu_ms`] for embedder profiler overlays.
+    frame_timer: Option<FrameTimer>,
+    frame_timer_tried: bool,
 }
 
 impl Renderer {
@@ -97,6 +107,8 @@ impl Renderer {
             settings,
             layers: layer::Stack::new(),
             scale_factor: None,
+            frame_timer: None,
+            frame_timer_tried: false,
 
             quad: quad::State::new(),
             triangle: triangle::State::new(&engine.device, &engine.triangle_pipeline),
@@ -138,8 +150,39 @@ impl Renderer {
                     label: Some("iced_wgpu encoder"),
                 });
 
+        // Whole-frame GPU timing (patch): lazily create the timer, advance last
+        // frame's async readback, then bracket the encoder so the embedder can
+        // attribute UI-render cost. Two empty timestamp-only passes; negligible.
+        if !self.frame_timer_tried {
+            self.frame_timer_tried = true;
+            if self
+                .engine
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY)
+            {
+                let period = self.engine.queue.get_timestamp_period();
+                if period > 0.0 {
+                    self.frame_timer = Some(FrameTimer::new(&self.engine.device, period));
+                }
+            }
+        }
+        if let Some(timer) = self.frame_timer.as_mut() {
+            timer.drive(&self.engine.device);
+        }
+        if let Some(timer) = self.frame_timer.as_ref() {
+            timer.begin(&mut encoder, target);
+        }
+
         self.prepare(&mut encoder, viewport);
         self.render(&mut encoder, target, clear_color, viewport);
+
+        if let Some(timer) = self.frame_timer.as_ref() {
+            timer.end(&mut encoder, target);
+        }
+        if let Some(timer) = self.frame_timer.as_mut() {
+            timer.resolve(&mut encoder);
+        }
 
         self.quad.trim();
         self.triangle.trim();
@@ -911,19 +954,25 @@ impl renderer::Headless for Renderer {
             .await
             .ok()?;
 
+        // corsetta patch — mirror the windowed compositor's adapter-guarded
+        // feature set for embedded renderers: 8x MSAA on adapter-specific formats,
+        // native BC texture upload, and per-pass GPU timestamp profiling.
+        // Keep when rebasing on upstream (see corsetta docs/iced-migration.md).
+        let mut headless_features = wgpu::Features::empty();
+        for feature in [
+            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            wgpu::Features::TEXTURE_COMPRESSION_BC,
+            wgpu::Features::TIMESTAMP_QUERY,
+        ] {
+            if adapter.features().contains(feature) {
+                headless_features |= feature;
+            }
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("iced_wgpu [headless]"),
-                // Allow embedded renderers 8x MSAA on adapter-specific formats
-                // (e.g. Rgba16Float) when the adapter supports the feature.
-                required_features: if adapter
-                    .features()
-                    .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
-                {
-                    wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                } else {
-                    wgpu::Features::empty()
-                },
+                required_features: headless_features,
                 required_limits: wgpu::Limits {
                     max_bind_groups: 4,
                     ..wgpu::Limits::default()

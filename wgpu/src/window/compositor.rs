@@ -168,6 +168,10 @@ impl Compositor {
         // SHADER_F16: iced's own use. TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES:
         // lets an embedded renderer (shader widget) use 8x MSAA on
         // adapter-specific formats such as the Rgba16Float HDR target.
+        // TEXTURE_COMPRESSION_BC: lets the embedded renderer upload native
+        // BC1/BC3/BC7 DDS textures (AC liveries) without CPU decoding.
+        // TIMESTAMP_QUERY: per-pass GPU profiling in the embedded renderer.
+        // corsetta patch — keep when rebasing on upstream (see corsetta docs/iced-migration.md).
         let mut required_features = wgpu::Features::empty();
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             required_features |= wgpu::Features::SHADER_F16;
@@ -177,6 +181,15 @@ impl Compositor {
             .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
         {
             required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+        {
+            required_features |= wgpu::Features::TEXTURE_COMPRESSION_BC;
+        }
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
 
         let mut errors = Vec::new();
