@@ -957,7 +957,8 @@ impl renderer::Headless for Renderer {
         // corsetta patch — mirror the windowed compositor's adapter-guarded
         // feature set for embedded renderers: 8x MSAA on adapter-specific formats,
         // native BC texture upload, and per-pass GPU timestamp profiling.
-        // Keep when rebasing on upstream (see corsetta docs/iced-migration.md).
+        // Keep when rebasing on upstream (the fork's patches are listed in
+        // corsetta crates/corsetta-app/Cargo.toml).
         let mut headless_features = wgpu::Features::empty();
         for feature in [
             wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
@@ -973,9 +974,19 @@ impl renderer::Headless for Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("iced_wgpu [headless]"),
                 required_features: headless_features,
+                // Match the interactive compositor path (window/compositor.rs),
+                // which raises texture/buffer caps to the adapter's real maxima via
+                // `using_resolution`. Without this the headless capture device stays
+                // at the 8192 texture-dimension default and panics on cars whose maps
+                // exceed it (e.g. vrc_formula_alpha's 9216-wide body map), diverging
+                // from what the real app can render. Keep on rebase.
                 required_limits: wgpu::Limits {
                     max_bind_groups: 4,
-                    ..wgpu::Limits::default()
+                    // Native-only app: raise past WebGL2's 16-sampled-texture floor
+                    // so headless capture matches the interactive renderer (which
+                    // binds e.g. the LTC area-light LUT). Keep on rebase.
+                    max_sampled_textures_per_shader_stage: 32,
+                    ..wgpu::Limits::default().using_resolution(adapter.limits())
                 },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,

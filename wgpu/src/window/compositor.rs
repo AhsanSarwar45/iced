@@ -161,6 +161,12 @@ impl Compositor {
         let limits = limits.into_iter().map(|limits| wgpu::Limits {
             max_bind_groups: 4,
             max_non_sampler_bindings: 2048,
+            // corsetta patch: this app is native-only (no WebGL2 target), so the
+            // embedded renderer is no longer bound by WebGL2's 16-sampled-texture
+            // floor. Raise it so the car über-shader can bind extra maps (e.g. the
+            // LTC area-light LUT) without the old binding-reuse contortions. Every
+            // desktop backend (Vulkan/Metal/DX12) supports far more than this.
+            max_sampled_textures_per_shader_stage: 32,
             ..limits
         });
 
@@ -171,7 +177,8 @@ impl Compositor {
         // TEXTURE_COMPRESSION_BC: lets the embedded renderer upload native
         // BC1/BC3/BC7 DDS textures (AC liveries) without CPU decoding.
         // TIMESTAMP_QUERY: per-pass GPU profiling in the embedded renderer.
-        // corsetta patch — keep when rebasing on upstream (see corsetta docs/iced-migration.md).
+        // corsetta patch — keep when rebasing on upstream (the fork's patches are
+        // listed in corsetta crates/corsetta-app/Cargo.toml).
         let mut required_features = wgpu::Features::empty();
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             required_features |= wgpu::Features::SHADER_F16;
@@ -411,11 +418,17 @@ pub struct Settings {
     pub antialiasing: Option<Antialiasing>,
 }
 
+// corsetta patch: default to `PRIMARY` (Vulkan/Metal/DX12) instead of `all()`,
+// which additionally offers GL. The embedded renderer requires capabilities the
+// GL backend cannot provide (`textureLoad` on depth textures, sampling one mip
+// while rendering another, >3-layer array render targets), and its GL
+// workarounds have been removed. Selecting GL would render incorrectly, so it is
+// not offered. Keep when rebasing on upstream.
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
             present_mode: wgpu::PresentMode::AutoVsync,
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::PRIMARY,
             power_preference: backend::PowerPreference::None,
             antialiasing: None,
         }
@@ -428,14 +441,15 @@ impl From<backend::Settings> for Settings {
             .backend
             .hardware()
             .map(|api| match api {
-                backend::Api::Best => wgpu::Backends::all(),
+                // corsetta patch: `Best` must not resolve to GL — see above.
+                backend::Api::Best => wgpu::Backends::PRIMARY,
                 backend::Api::Vulkan => wgpu::Backends::VULKAN,
                 backend::Api::Metal => wgpu::Backends::METAL,
                 backend::Api::DirectX12 => wgpu::Backends::DX12,
                 backend::Api::OpenGL => wgpu::Backends::GL,
                 backend::Api::WebGPU => wgpu::Backends::BROWSER_WEBGPU,
             })
-            .unwrap_or_else(wgpu::Backends::all);
+            .unwrap_or(wgpu::Backends::PRIMARY);
 
         Self {
             present_mode: if settings.vsync {
