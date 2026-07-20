@@ -36,8 +36,14 @@ wgpu = ["wgpu-bare", "iced_renderer/wgpu"]
 wgpu-bare = ["iced_renderer/wgpu-bare", "iced_widget/wgpu"]
 # Enables the `tiny-skia` software renderer
 tiny-skia = ["iced_renderer/tiny-skia"]
-# Enables the `image` widget and image clipboard support
-image = ["image-without-codecs", "image/default", "iced_winit/image"]
+# Enables the `image` widget and image clipboard support.
+# FORK DEVIATION: upstream enables `image/default`, which pulls EVERY codec — avif
+# (rav1e / av-scenechange), openexr, webp, gif, tiff. Corsetta only ever decodes png/jpeg
+# (UI/previews) and .hdr (via corsetta-core), and that codec bloat emits shared-generic
+# `anon.*.llvm.*` locals that neither rust-lld nor ld.bfd can resolve — a nondeterministic
+# link failure (see [[app-link-lld-image-flake]]). Restricting to png+jpeg removes the
+# bloat AND fixes the link. Re-check on every upstream rebase.
+image = ["image-without-codecs", "image/png", "image/jpeg", "iced_winit/image"]
 # Enables the `image` widget, without any built-in codecs of the `image` crate
 image-without-codecs = ["iced_widget/image", "dep:image"]
 # Enables the `svg` widget

@@ -17,6 +17,9 @@ pub mod clipboard;
 pub mod color;
 pub mod event;
 pub mod font;
+// corsetta patch — who paces the frame loop (app vs compositor). Read by both
+// iced_wgpu (swapchain present mode) and iced_winit (redraw throttle).
+pub mod frame_pacing;
 pub mod gradient;
 pub mod image;
 pub mod input_method;

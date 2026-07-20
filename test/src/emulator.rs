@@ -480,6 +480,12 @@ impl<P: Program + 'static> Emulator<P> {
             mouse::Cursor::Unavailable,
         );
 
+        // Put the cache back (every other path does this) so `screenshot` can be
+        // called more than once — a multi-frame profiling capture renders several
+        // frames before the final read (`screenshot_frames`), and without this the
+        // second call's `self.cache.take().unwrap()` panics on `None`.
+        self.cache = Some(user_interface.into_cache());
+
         let physical_size = Size::new(
             (self.size.width * scale_factor).round() as u32,
             (self.size.height * scale_factor).round() as u32,

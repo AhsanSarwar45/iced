@@ -265,6 +265,44 @@ pub fn screenshot<P: program::Program + 'static>(
     scale_factor: f32,
     duration: Duration,
 ) -> window::Screenshot {
+    screenshot_frames(program, theme, viewport, scale_factor, duration, 1)
+}
+
+/// Like [`screenshot`], but renders `frames` consecutive frames before capturing the
+/// last one. A single draw is enough for the image, but any measurement that resolves
+/// **asynchronously across frames** — notably a GPU timestamp profiler, whose readback
+/// lags the resolve by a frame or two — has no valid data after only one. A caller that
+/// wants those stats out of a headless capture (see corsetta's `CORSETTA_PROFILE_FRAMES`)
+/// asks for several frames so the readback cycle can settle; `frames == 1` is the plain
+/// screenshot. Each frame is a full prepare/render/submit + device poll, so the app's
+/// per-frame readback advances every iteration.
+pub fn screenshot_frames<P: program::Program + 'static>(
+    program: &P,
+    theme: &P::Theme,
+    viewport: impl Into<Size>,
+    scale_factor: f32,
+    duration: Duration,
+    frames: u32,
+) -> window::Screenshot {
+    screenshot_frames_with(program, theme, viewport, scale_factor, duration, frames, |_, _| {})
+}
+
+/// Like [`screenshot_frames`], but calls `between` once before every warm-up frame
+/// after the first (never before the very first render, never after the last). Lets
+/// a caller pump per-frame app state that only advances on a dispatched message —
+/// e.g. `Emulator::update(program, Message::Tick)` — across the warm-up frames, the
+/// same way corsetta's `CORSETTA_PROFILE_FRAMES`/`CORSETTA_AE_SETTLE` captures settle
+/// an async GPU readback (auto-exposure) that a plain multi-render loop never adopts,
+/// because nothing in that loop ever calls back into the program's `update`.
+pub fn screenshot_frames_with<P: program::Program + 'static>(
+    program: &P,
+    theme: &P::Theme,
+    viewport: impl Into<Size>,
+    scale_factor: f32,
+    duration: Duration,
+    frames: u32,
+    mut between: impl FnMut(&mut Emulator<P>, &P),
+) -> window::Screenshot {
     use crate::runtime::futures::futures::channel::mpsc;
 
     let (sender, mut receiver) = mpsc::channel(100);
@@ -293,5 +331,12 @@ pub fn screenshot<P: program::Program + 'static>(
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    emulator.screenshot(program, theme, scale_factor)
+    // Render `frames` full frames; keep the last. The warm-up frames exist so a
+    // cross-frame async readback (GPU profiler) can settle before the final capture.
+    let mut shot = emulator.screenshot(program, theme, scale_factor);
+    for _ in 1..frames.max(1) {
+        between(&mut emulator, program);
+        shot = emulator.screenshot(program, theme, scale_factor);
+    }
+    shot
 }

@@ -941,7 +941,22 @@ async fn run_instance<P>(
                             &mut window.surface,
                             window.state.viewport(),
                             window.state.background_color(),
-                            || window.raw.pre_present_notify(),
+                            || {
+                                // corsetta patch — THE compositor-cadence throttle.
+                                //
+                                // On Wayland `pre_present_notify()` issues a
+                                // `wl_surface.frame` request, and the next
+                                // `RedrawRequested` is gated on that callback. Since
+                                // the redraw loop runs off `RedrawRequested`, calling
+                                // this unconditionally pins the whole loop to the
+                                // compositor's cadence — above the swapchain, so no
+                                // `PresentMode` can matter. Skip it when the app has
+                                // asked for a non-vsync mode, i.e. asked to pace
+                                // itself. Defaults to calling it (stock behaviour).
+                                if crate::core::frame_pacing::throttle_to_compositor() {
+                                    window.raw.pre_present_notify();
+                                }
+                            },
                         ) {
                             Ok(()) => {
                                 present_span.finish();

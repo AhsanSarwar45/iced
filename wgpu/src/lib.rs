@@ -54,11 +54,61 @@ pub use iced_graphics::core;
 pub use wgpu;
 
 pub use engine::Engine;
-pub use frame_timer::last_ui_gpu_ms;
+pub use frame_timer::{last_primitive_gpu_ms, last_ui_gpu_ms};
 pub use layer::Layer;
 pub use primitive::Primitive;
 
 use frame_timer::FrameTimer;
+
+// corsetta patch — LIVE present-mode switching.
+//
+// With the `shader`-widget architecture the compositor owns the wgpu `Surface`; the
+// application never holds it and so cannot re-`configure()` the swapchain to change
+// `present_mode` while running. This global lets the app REQUEST a present mode at
+// any time; `window::Compositor::present` picks it up on the next frame and
+// reconfigures (clamping to a mode the surface actually supports). One process here
+// = one window, so a global atomic is sufficient and needs no runtime plumbing.
+// The request itself is stored in `iced_core::frame_pacing` — the ONE place both
+// this crate and `iced_winit` can see. Skipping the redraw throttle there is what
+// actually lets a non-vsync mode take effect; setting it only here would change the
+// swapchain while the redraw loop stayed pinned to compositor cadence.
+mod present_mode_control {
+    use crate::core::frame_pacing::{self, PresentModeRequest};
+
+    fn to_request(mode: wgpu::PresentMode) -> PresentModeRequest {
+        match mode {
+            wgpu::PresentMode::AutoVsync => PresentModeRequest::AutoVsync,
+            wgpu::PresentMode::AutoNoVsync => PresentModeRequest::AutoNoVsync,
+            wgpu::PresentMode::Fifo => PresentModeRequest::Fifo,
+            wgpu::PresentMode::FifoRelaxed => PresentModeRequest::FifoRelaxed,
+            wgpu::PresentMode::Immediate => PresentModeRequest::Immediate,
+            wgpu::PresentMode::Mailbox => PresentModeRequest::Mailbox,
+        }
+    }
+
+    fn from_request(mode: PresentModeRequest) -> wgpu::PresentMode {
+        match mode {
+            PresentModeRequest::AutoVsync => wgpu::PresentMode::AutoVsync,
+            PresentModeRequest::AutoNoVsync => wgpu::PresentMode::AutoNoVsync,
+            PresentModeRequest::Fifo => wgpu::PresentMode::Fifo,
+            PresentModeRequest::FifoRelaxed => wgpu::PresentMode::FifoRelaxed,
+            PresentModeRequest::Immediate => wgpu::PresentMode::Immediate,
+            PresentModeRequest::Mailbox => wgpu::PresentMode::Mailbox,
+        }
+    }
+
+    /// Request a live present-mode change. Applied by the compositor on its next
+    /// present, and by the redraw loop's throttle decision. corsetta patch.
+    pub fn set_present_mode(mode: wgpu::PresentMode) {
+        frame_pacing::request_present_mode(to_request(mode));
+    }
+
+    /// The present mode requested via [`set_present_mode`], if any. corsetta patch.
+    pub fn requested_present_mode() -> Option<wgpu::PresentMode> {
+        frame_pacing::requested_present_mode().map(from_request)
+    }
+}
+pub use present_mode_control::{requested_present_mode, set_present_mode};
 
 #[cfg(feature = "geometry")]
 pub use geometry::Geometry;
@@ -611,10 +661,22 @@ impl Renderer {
                 if !need_render.is_empty() {
                     let _ = ManuallyDrop::into_inner(render_pass);
 
+                    // Bracket the embedder's own passes (patch, see `frame_timer`), so a
+                    // profiler overlay can separate Iced's widget drawing from them instead
+                    // of lumping both into one residual. Two empty timestamp-only passes;
+                    // they are legal here only because `render_pass` is closed.
+                    if let Some(timer) = self.frame_timer.as_ref() {
+                        timer.primitive_begin(encoder, frame);
+                    }
+
                     for (instance, clip_bounds) in need_render {
                         instance
                             .primitive
                             .render(&primitive_storage, encoder, frame, &clip_bounds);
+                    }
+
+                    if let Some(timer) = self.frame_timer.as_ref() {
+                        timer.primitive_end(encoder, frame);
                     }
 
                     render_pass =
@@ -964,6 +1026,45 @@ impl renderer::Headless for Renderer {
             wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
             wgpu::Features::TEXTURE_COMPRESSION_BC,
             wgpu::Features::TIMESTAMP_QUERY,
+            // BINDLESS. Not optional and not a nicety: corsetta's ONE material path is a texture
+            // `binding_array` + a storage-buffer material table (`render/bindless.rs`), so without
+            // these the surface shader fails VALIDATION — "Capability
+            // TEXTURE_AND_SAMPLER_BINDING_ARRAY is not supported" — and no pipeline is created at
+            // all. This is the headless/offscreen device (`CORSETTA_HEADLESS`, the debug harness);
+            // window/compositor.rs is the interactive one and requests the same three. Both must,
+            // or the harness cannot render what the app renders — which is the entire point of
+            // there being no separate offscreen renderer.
+            wgpu::Features::TEXTURE_BINDING_ARRAY,
+            wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+            wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY,
+            // TRANSMISSION. The transparent pass blends `color = src0 + Src1 · dst` so the
+            // shader can hand the blender a per-CHANNEL transmittance — Beer-Lambert through
+            // tinted glass is not a scalar, and `ALPHA_BLENDING` can only weight the background
+            // by one number. Like BINDLESS above, this is not optional: surface.wgsl's
+            // `fs_main_blend` declares `@blend_src`, so without it the transparent pipeline
+            // fails validation and no glass draws at all.
+            wgpu::Features::DUAL_SOURCE_BLENDING,
+            // TEXTURE_FORMAT_16BIT_NORM — the MSM16 moment shadow store (msm.wgsl,
+            // docs/shadows.md) resolves into an Rgba16Unorm render target, which needs this.
+            // window/compositor.rs (the interactive device) requests the same — both must.
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+            // POLYGON_MODE_LINE — the debug wireframe views (64-66) rasterise meshes as line
+            // polygons (`SurfacePipelines::wireframe`). window/compositor.rs (the interactive
+            // device) requests it too; both must, or a headless capture of a wireframe view
+            // silently degrades to Fill and verifies the wrong render.
+            wgpu::Features::POLYGON_MODE_LINE,
+            // DEPTH_CLIP_CONTROL — shadow-caster pancaking (docs/shadows.md §2.2): the
+            // cascade pipelines rasterise with unclipped depth so casters sunward of a
+            // split's near plane still occlude. window/compositor.rs requests it too;
+            // without it the renderer falls back to an extended near plane.
+            wgpu::Features::DEPTH_CLIP_CONTROL,
+            // GPU-DRIVEN rendering (docs/geometry-lod.md §7a): the cull compute pass emits a
+            // compacted draw list whose length the CPU never learns. window/compositor.rs (the
+            // interactive device) requests the same three; both must, or a headless capture
+            // silently verifies the CPU submission path while the app runs the indirect one.
+            // Feature-detected on both sides — `render/gpu_cull.rs::optional_features()`.
+            wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
+            wgpu::Features::INDIRECT_FIRST_INSTANCE,
         ] {
             if adapter.features().contains(feature) {
                 headless_features |= feature;
@@ -986,6 +1087,36 @@ impl renderer::Headless for Renderer {
                     // so headless capture matches the interactive renderer (which
                     // binds e.g. the LTC area-light LUT). Keep on rebase.
                     max_sampled_textures_per_shader_stage: 32,
+                    // Interior-capture G-buffer: 5 targets = 36 B/sample, over the
+                    // 32 B default that `using_resolution` leaves untouched. Keep on rebase.
+                    max_color_attachment_bytes_per_sample: adapter
+                        .limits()
+                        .max_color_attachment_bytes_per_sample
+                        .max(32),
+                    // BINDLESS: this limit DEFAULTS TO ZERO, so the features above are not enough
+                    // on their own — with it at 0 a `binding_array` cannot be declared at all, and
+                    // the failure surfaces as an unreadable shader-validation error rather than a
+                    // missing feature. 1024 matches window/compositor.rs and DX12's per-array
+                    // validation ceiling (render/bindless.rs::MAX_TEXTURES). Keep on rebase.
+                    max_binding_array_elements_per_shader_stage: 1024,
+                    // The PRECOMPUTED TRANSFER is one scene-wide storage buffer and a TRACK's is
+                    // hundreds of MB. `max_storage_buffer_binding_size` defaults to 128 MiB — a
+                    // WebGPU baseline, not hardware (this adapter: 2 GiB) — and `using_resolution`
+                    // does not raise it. Mirrors window/compositor.rs. Keep on rebase.
+                    max_storage_buffer_binding_size: adapter.limits().max_storage_buffer_binding_size,
+                    max_buffer_size: adapter.limits().max_buffer_size,
+                    // corsetta patch — the PROBE LADDER packs every resident probe's radiance cube into
+                    // one cube-array (6 layers/probe, static-light-transport.md §10 steps 9-10); the
+                    // 256-layer default caps that at 42 probes. Native adapters report 2048+. Keep on rebase.
+                    max_texture_array_layers: adapter.limits().max_texture_array_layers,
+                    // corsetta patch — the GPU WING-KERNEL SYNTHESIS (`render/psf_kernel_gpu.rs`)
+                    // shares ONE bind-group layout across every entry point in
+                    // `psf_kernel_synth.wgsl`, declaring 10 storage buffers. wgpu counts the
+                    // LAYOUT's bindings against this limit, not the subset any single entry point
+                    // reads, so the 8 of the WebGPU baseline is not enough and every physical-camera
+                    // scene aborts at `create_bind_group_layout`. `using_resolution` does not touch
+                    // it. Native adapters report 32+. Keep on rebase.
+                    max_storage_buffers_per_shader_stage: adapter.limits().max_storage_buffers_per_shader_stage,
                     ..wgpu::Limits::default().using_resolution(adapter.limits())
                 },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,

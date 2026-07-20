@@ -6,29 +6,40 @@
 //! primitives — into one command encoder and submits it (see [`crate::Renderer::draw`]).
 //! An embedder's own per-pass profiler (e.g. corsetta's `render::Profiler`) can
 //! only see its *own* passes; the time Iced spends on quads/text/images is
-//! invisible to it. [`FrameTimer`] brackets the whole encoder with a timestamp
-//! pair (two empty render passes carrying only a begin/end timestamp), reads the
-//! span back asynchronously, and publishes the smoothed millisecond value to a
-//! process-global slot. The embedder reads [`last_ui_gpu_ms`] and subtracts its
-//! own summed passes to attribute the remainder to UI rendering + overhead.
+//! invisible to it. [`FrameTimer`] therefore records **two** nested timestamp
+//! spans (each an empty render pass carrying only a begin/end timestamp):
+//!
+//! * the **whole encoder** → [`last_ui_gpu_ms`], and
+//! * the **shader-primitive region** → [`last_primitive_gpu_ms`]: the part of
+//!   [`crate::Renderer::render`] where custom primitives (i.e. the embedder's own
+//!   renderer) record their passes.
+//!
+//! Those two are what let an embedder split a genuine **`ui`** number from a
+//! catch-all "other". Iced's own drawing is `whole − primitive` — a *measured*
+//! quantity, not a residual. Whatever is left inside the primitive region after
+//! the embedder's own spans (`primitive − Σ spans`) is the embedder's own untimed
+//! GPU work, which is a completely different thing and belongs in its own row.
+//! Lumping them together (the old single-timer scheme) produced one `ui/other` bar
+//! that could grow for either reason and told you nothing about which.
 //!
 //! Requires [`wgpu::Features::TIMESTAMP_QUERY`]; without it the timer is never
-//! created and [`last_ui_gpu_ms`] stays `None`.
+//! created and both accessors stay `None`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Sentinel bit pattern meaning "no UI GPU timing available yet". A real ms
-/// value is a finite non-negative `f32`, so it never collides with this NaN.
+/// Sentinel bit pattern meaning "no GPU timing available yet". A real ms value is
+/// a finite non-negative `f32`, so it never collides with this NaN.
 const UNSET: u32 = u32::MAX;
 static UI_GPU_MS_BITS: AtomicU32 = AtomicU32::new(UNSET);
+static PRIM_GPU_MS_BITS: AtomicU32 = AtomicU32::new(UNSET);
 
 /// Smoothed GPU time (in ms) Iced spent rendering the most recently *timed*
 /// frame — the full submitted encoder, including any embedded shader primitives.
 ///
 /// Returns `None` when the device lacks `TIMESTAMP_QUERY` or no frame has been
-/// timed yet. Embedders that also time their own passes can subtract that sum
-/// from this total to isolate the UI/overhead portion. See corsetta's stats HUD.
+/// timed yet. Subtract [`last_primitive_gpu_ms`] to get Iced's OWN drawing cost
+/// (quads/text/images/clear). See corsetta's stats HUD.
 pub fn last_ui_gpu_ms() -> Option<f32> {
     match UI_GPU_MS_BITS.load(Ordering::Relaxed) {
         UNSET => None,
@@ -36,8 +47,28 @@ pub fn last_ui_gpu_ms() -> Option<f32> {
     }
 }
 
-/// Two timestamp slots: begin (0) and end (1) of the frame's command encoder.
-const QUERY_COUNT: u32 = 2;
+/// Smoothed GPU time (in ms) spent inside the **custom shader primitives** of the
+/// most recently timed frame — i.e. the embedder's own renderer, measured from the
+/// first primitive's `render` to the last's.
+///
+/// `last_ui_gpu_ms() − last_primitive_gpu_ms()` is Iced's own widget drawing;
+/// `last_primitive_gpu_ms() − (the embedder's summed spans)` is the embedder's
+/// untimed GPU work. Returns `None` when timing is unavailable, and `Some(0.0)`
+/// on a frame that drew no shader primitive at all.
+pub fn last_primitive_gpu_ms() -> Option<f32> {
+    match PRIM_GPU_MS_BITS.load(Ordering::Relaxed) {
+        UNSET => None,
+        bits => Some(f32::from_bits(bits)),
+    }
+}
+
+/// Four timestamp slots: begin/end of the whole encoder (0, 1) and begin/end of
+/// the shader-primitive region (2, 3).
+const QUERY_COUNT: u32 = 4;
+const FRAME_BEGIN: u32 = 0;
+const FRAME_END: u32 = 1;
+const PRIM_BEGIN: u32 = 2;
+const PRIM_END: u32 = 3;
 
 /// Owns the timestamp query set + async readback for whole-encoder GPU timing.
 /// The renderer holds one; [`begin`](Self::begin)/[`end`](Self::end) bracket the
@@ -52,8 +83,9 @@ pub(crate) struct FrameTimer {
     ready: Arc<AtomicBool>,    // set by the map callback when readback is mapped
     inflight: bool,            // a map cycle is outstanding
     resolved: bool,            // readback holds fresh resolved data awaiting a map
-    ms: f32,                   // exponentially-smoothed frame GPU time
-    last_raw: [u64; 2],        // last frame's raw begin/end ticks
+    ms: f32,                   // exponentially-smoothed whole-encoder GPU time
+    prim_ms: f32,              // exponentially-smoothed shader-primitive region time
+    last_raw: [u64; QUERY_COUNT as usize], // last frame's raw ticks, per slot
 }
 
 impl FrameTimer {
@@ -86,7 +118,8 @@ impl FrameTimer {
             inflight: false,
             resolved: false,
             ms: 0.0,
-            last_raw: [0; 2],
+            prim_ms: 0.0,
+            last_raw: [0; QUERY_COUNT as usize],
         }
     }
 
@@ -94,13 +127,35 @@ impl FrameTimer {
     /// the encoder. `target` is loaded + stored unchanged (a no-op we only need
     /// because WebGPU timestamps must live inside a render pass).
     pub(crate) fn begin(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
-        self.marker(encoder, target, Some(0), None);
+        self.marker(encoder, target, Some(FRAME_BEGIN), None);
     }
 
     /// Empty render pass carrying only the end timestamp — record it last, after
     /// all UI + primitive passes.
     pub(crate) fn end(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
-        self.marker(encoder, target, None, Some(1));
+        self.marker(encoder, target, None, Some(FRAME_END));
+    }
+
+    /// Open the **shader-primitive** span — record immediately before the first
+    /// custom primitive's `render` (the embedder's own passes).
+    pub(crate) fn primitive_begin(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        self.marker(encoder, target, Some(PRIM_BEGIN), None);
+    }
+
+    /// Close the shader-primitive span — record immediately after the last custom
+    /// primitive's `render`. With several primitive regions in a frame the begin
+    /// is written once (at the first) and the end is overwritten at each, so the
+    /// span covers first-begin → last-end.
+    pub(crate) fn primitive_end(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        self.marker(encoder, target, None, Some(PRIM_END));
     }
 
     fn marker(
@@ -158,22 +213,45 @@ impl FrameTimer {
         }
         {
             let view = self.readback.slice(..).get_mapped_range();
-            let t0 = u64::from_le_bytes(view[0..8].try_into().unwrap());
-            let t1 = u64::from_le_bytes(view[8..16].try_into().unwrap());
-            // Unchanged raw ticks ⇒ nothing new was recorded; treat as 0.
-            let ran = t0 != self.last_raw[0] || t1 != self.last_raw[1];
-            self.last_raw = [t0, t1];
-            let sample = if ran && t1 > t0 {
-                (t1 - t0) as f32 * self.period_ns / 1.0e6
-            } else {
-                0.0
+            let mut raw = [0u64; QUERY_COUNT as usize];
+            for (i, slot) in raw.iter_mut().enumerate() {
+                *slot = u64::from_le_bytes(
+                    view[i * 8..i * 8 + 8].try_into().unwrap(),
+                );
+            }
+
+            // A span whose two raw ticks are byte-identical to last frame did NOT
+            // run (a timestamp that actually fired always advances the GPU clock),
+            // so it reads 0 rather than repeating a stale figure. That is what makes
+            // "this frame drew no shader primitive" report as 0 ms instead of the
+            // last frame that did.
+            let span = |begin: u32, end: u32, last: &[u64; QUERY_COUNT as usize]| {
+                let (b, e) = (begin as usize, end as usize);
+                let ran = raw[b] != last[b] || raw[e] != last[e];
+                if ran && raw[e] > raw[b] {
+                    (raw[e] - raw[b]) as f32 * self.period_ns / 1.0e6
+                } else {
+                    0.0
+                }
             };
-            self.ms = if self.ms == 0.0 {
-                sample
-            } else {
-                self.ms * 0.85 + sample * 0.15
+            let frame = span(FRAME_BEGIN, FRAME_END, &self.last_raw);
+            let prim = span(PRIM_BEGIN, PRIM_END, &self.last_raw);
+            self.last_raw = raw;
+
+            // Same exponential smoothing on both, so the derived `ui = frame − prim`
+            // is a difference of two equally-lagged numbers rather than a beat
+            // between a smoothed and an unsmoothed one.
+            let smooth = |prev: f32, sample: f32| {
+                if prev == 0.0 {
+                    sample
+                } else {
+                    prev * 0.85 + sample * 0.15
+                }
             };
+            self.ms = smooth(self.ms, frame);
+            self.prim_ms = smooth(self.prim_ms, prim);
             UI_GPU_MS_BITS.store(self.ms.to_bits(), Ordering::Relaxed);
+            PRIM_GPU_MS_BITS.store(self.prim_ms.to_bits(), Ordering::Relaxed);
         }
         self.readback.unmap();
         self.ready.store(false, Ordering::Release);
