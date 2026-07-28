@@ -25,7 +25,7 @@
 //! cliff. Exceeding refresh for real additionally needs an `Immediate` swapchain,
 //! fullscreen, and compositor tearing support.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 /// A present mode requested by the application, as a backend-agnostic enum so
 /// `iced_core` needs no `wgpu` dependency. Mirrors `wgpu::PresentMode`.
@@ -104,4 +104,30 @@ pub fn requested_present_mode() -> Option<PresentModeRequest> {
 /// the compositor's cadence.
 pub fn throttle_to_compositor() -> bool {
     requested_present_mode().is_none_or(PresentModeRequest::is_compositor_paced)
+}
+
+// corsetta patch — the FPS cap, read by `iced_winit`'s redraw loop.
+//
+// The cap is enforced by the redraw loop itself (`RedrawRequest::At(deadline)`),
+// NOT by an app-side sleep. That is the whole point: a sleep that ran once per
+// `Message::Tick` was decoupled from the actual present (which happens per
+// `RedrawRequested`), so under a self-pacing (non-vsync) present mode the loop
+// could free-run and outrun the cap. Pacing the redraw request at the single
+// synchronous per-present point makes it a single driver that cannot be bypassed.
+const UNSET_CAP: u32 = u32::MAX;
+static FRAME_CAP_HZ: AtomicU32 = AtomicU32::new(UNSET_CAP);
+
+/// Request an FPS cap in Hz. `0` = uncapped. Picked up by the redraw loop each
+/// frame. corsetta patch.
+pub fn request_frame_cap(hz: u32) {
+    FRAME_CAP_HZ.store(hz, Ordering::Relaxed);
+}
+
+/// The requested FPS cap in Hz, or `0` (uncapped) if the app has set none.
+/// corsetta patch.
+pub fn frame_cap_hz() -> u32 {
+    match FRAME_CAP_HZ.load(Ordering::Relaxed) {
+        UNSET_CAP => 0,
+        hz => hz,
+    }
 }

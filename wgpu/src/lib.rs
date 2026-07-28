@@ -107,8 +107,15 @@ mod present_mode_control {
     pub fn requested_present_mode() -> Option<wgpu::PresentMode> {
         frame_pacing::requested_present_mode().map(from_request)
     }
+
+    /// Request a live FPS cap in Hz (`0` = uncapped). Enforced by `iced_winit`'s
+    /// redraw loop (deadline-paced redraw requests), so it holds regardless of
+    /// present mode. corsetta patch.
+    pub fn set_frame_cap(hz: u32) {
+        frame_pacing::request_frame_cap(hz);
+    }
 }
-pub use present_mode_control::{requested_present_mode, set_present_mode};
+pub use present_mode_control::{requested_present_mode, set_frame_cap, set_present_mode};
 
 #[cfg(feature = "geometry")]
 pub use geometry::Geometry;

@@ -87,6 +87,7 @@ where
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
+                paced_at: None,
                 preedit: None,
                 ime_state: None,
             },
@@ -184,6 +185,11 @@ where
     pub surface_version: u64,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,
+    /// corsetta patch — the FPS-cap pacing deadline. The advancing "next frame"
+    /// instant the redraw loop schedules `RedrawRequest::At` against when a cap is
+    /// set. Distinct from `redraw_at` (which is cleared each time it fires); this
+    /// carries the deadline forward so it advances by exactly one period.
+    pub paced_at: Option<Instant>,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(Rectangle, input_method::Purpose)>,
 }

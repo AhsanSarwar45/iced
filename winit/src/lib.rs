@@ -760,6 +760,50 @@ async fn run_instance<P>(
                             continue;
                         }
 
+                        // corsetta patch — THE FPS cap. A single gate, synchronous
+                        // with the present, at the one point EVERY redraw funnels
+                        // through: sleep/spin until this frame's deadline before doing
+                        // any per-frame work, so the present *rate* is capped no matter
+                        // how many redraws were requested (winit coalesces duplicate
+                        // `request_redraw()`s into one `RedrawRequested`, so extra
+                        // drivers can't beat this). Replaces the old app-side per-`Tick`
+                        // sleep, which ran decoupled from the present and so let a
+                        // self-pacing (non-vsync) mode free-run past the cap. Skipped
+                        // when uncapped (`cap == 0`) or when the compositor paces us
+                        // (true-vsync modes — the swapchain/`pre_present_notify` gate
+                        // already holds the rate; a second sleep would only add lag).
+                        if !crate::core::frame_pacing::throttle_to_compositor() {
+                            let cap = crate::core::frame_pacing::frame_cap_hz();
+                            if cap > 0 {
+                                let period =
+                                    std::time::Duration::from_secs_f64(1.0 / f64::from(cap));
+                                let now = Instant::now();
+                                // One period on from the last deadline, but never more
+                                // than one period behind the wall clock, so a stall
+                                // can't queue up make-up frames.
+                                let base = window.paced_at.unwrap_or(now).max(now - period);
+                                let deadline = base + period;
+                                if let Some(wait) = deadline.checked_duration_since(now) {
+                                    // Sleep the bulk (OS granularity is ~1–15 ms, too
+                                    // coarse to land a 5.5 ms frame), then spin the last
+                                    // ~1 ms for accuracy.
+                                    if wait > std::time::Duration::from_micros(1500) {
+                                        std::thread::sleep(
+                                            wait - std::time::Duration::from_micros(1000),
+                                        );
+                                    }
+                                    while Instant::now() < deadline {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                                window.paced_at = Some(deadline);
+                            } else {
+                                window.paced_at = None;
+                            }
+                        } else {
+                            window.paced_at = None;
+                        }
+
                         // Window was resized between redraws
                         if window.surface_version != window.state.surface_version() {
                             #[cfg(feature = "hinting")]
