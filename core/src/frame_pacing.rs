@@ -131,3 +131,80 @@ pub fn frame_cap_hz() -> u32 {
         hz => hz,
     }
 }
+
+// corsetta patch — how long the cap above actually held the thread.
+//
+// The sleep+spin that enforces the cap runs in the redraw loop, outside every span
+// an embedder can record: it is not its `prepare`, not its command recording, not
+// GPU time, and not the present block either. An embedder that reports leftover
+// frame time as "present/idle" therefore mislabels this as a vsync wait — and,
+// because the pause shrinks by exactly as much as the frame's work grows, it makes
+// that row swing on every wobble in work. Publishing it lets the pause be shown as
+// what it is: deliberate pacing.
+const UNSET_PACED: u32 = u32::MAX;
+static PACED_MS_BITS: AtomicU32 = AtomicU32::new(UNSET_PACED);
+
+/// Record the wall-clock ms the redraw loop was held at the frame-cap deadline.
+/// Raw, one sample per redraw — a consumer can smooth, but cannot un-smooth.
+/// corsetta patch.
+pub fn record_paced_ms(ms: f32) {
+    PACED_MS_BITS.store(ms.to_bits(), Ordering::Relaxed);
+}
+
+/// Wall-clock ms the last redraw spent waiting for the frame-cap deadline. `None`
+/// until the first paced frame; `Some(0.0)` when uncapped or already late.
+/// corsetta patch.
+pub fn last_paced_ms() -> Option<f32> {
+    match PACED_MS_BITS.load(Ordering::Relaxed) {
+        UNSET_PACED => None,
+        bits => Some(f32::from_bits(bits)),
+    }
+}
+
+// corsetta patch — the gap BETWEEN redraws.
+//
+// A frame's wall time is measured tick to tick, but the redraw loop only starts
+// timing anything once `RedrawRequested` arrives. Everything before that — the
+// event-loop wait, the OS event pump, the compositor's dispatch — is outside every
+// span an embedder can record, so a loop that wakes late reports a long frame with
+// nothing to blame. It is distinct from the frame-cap pause: that one is a sleep we
+// asked for, this one is time we did not.
+const UNSET_LOOP: u32 = u32::MAX;
+static LOOP_WAIT_MS_BITS: AtomicU32 = AtomicU32::new(UNSET_LOOP);
+
+/// Record the wall-clock ms between the end of the previous redraw and the start of
+/// this one. Raw, one sample per redraw. corsetta patch.
+pub fn record_loop_wait_ms(ms: f32) {
+    LOOP_WAIT_MS_BITS.store(ms.to_bits(), Ordering::Relaxed);
+}
+
+/// Time the redraw loop spent outside its own work before this frame began. `None`
+/// until the second redraw (the first has no predecessor). corsetta patch.
+pub fn last_loop_wait_ms() -> Option<f32> {
+    match LOOP_WAIT_MS_BITS.load(Ordering::Relaxed) {
+        UNSET_LOOP => None,
+        bits => Some(f32::from_bits(bits)),
+    }
+}
+
+// corsetta patch — the redraw itself, first instruction to after the present.
+//
+// The closing half of the pair above: `redraw_ms + loop_wait_ms` tiles the whole
+// period between two redraws with no gap, so an embedder can tell a frame that was
+// slow inside the redraw from one that was slow before it — and a frame time larger
+// than their sum from a clock that is not counting redraws.
+const UNSET_REDRAW: u32 = u32::MAX;
+static REDRAW_MS_BITS: AtomicU32 = AtomicU32::new(UNSET_REDRAW);
+
+/// Record the wall-clock ms this redraw took, present included. corsetta patch.
+pub fn record_redraw_ms(ms: f32) {
+    REDRAW_MS_BITS.store(ms.to_bits(), Ordering::Relaxed);
+}
+
+/// How long the last redraw took, present included. corsetta patch.
+pub fn last_redraw_ms() -> Option<f32> {
+    match REDRAW_MS_BITS.load(Ordering::Relaxed) {
+        UNSET_REDRAW => None,
+        bits => Some(f32::from_bits(bits)),
+    }
+}

@@ -359,6 +359,38 @@ pub async fn new(
     Compositor::request(settings, display, compatible_window, shell).await
 }
 
+/// corsetta patch — render the frame into an owned texture instead of the window's
+/// swapchain.
+///
+/// A soak run needs the REAL program — same event loop, same iced, same renderer,
+/// same pacing — without putting a window on the user's screen. `visible: false`
+/// alone does not achieve that on Wayland: presenting attaches a buffer to the
+/// surface, and attaching is what MAPS it, so the window appears the moment the app
+/// draws. The only way to render and stay unmapped is to never present.
+///
+/// What this gives up is exactly one span: the swapchain `acquire`. That measures
+/// ~0.02 ms on this path, so nothing worth measuring is lost — and the spans that
+/// matter (our CPU work, every GPU pass, and the frame-cap pacing, which lives in the
+/// redraw loop rather than the surface) are untouched.
+static OFFSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Route presents to an owned texture (see [`OFFSCREEN`]). Set before the first
+/// frame; changing it mid-run is allowed but pointless.
+pub fn set_offscreen(on: bool) {
+    OFFSCREEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether presents are being routed offscreen.
+pub fn is_offscreen() -> bool {
+    OFFSCREEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The offscreen target, rebuilt only when the viewport size changes.
+    static OFFSCREEN_TARGET: std::cell::RefCell<Option<(u32, u32, wgpu::Texture)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Presents the given primitives with the given [`Compositor`].
 pub fn present(
     renderer: &mut Renderer,
@@ -367,32 +399,94 @@ pub fn present(
     background_color: Color,
     on_pre_present: impl FnOnce(),
 ) -> Result<(), compositor::SurfaceError> {
-    match surface.get_current_texture() {
+    // Offscreen (see [`OFFSCREEN`]): draw the identical frame into our own texture
+    // and never touch the surface, so the window is never mapped.
+    if is_offscreen() {
+        let size = viewport.physical_size();
+        let (w, h) = (size.width.max(1), size.height.max(1));
+        let format = renderer.engine.format;
+        OFFSCREEN_TARGET.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if !matches!(&*slot, Some((tw, th, _)) if *tw == w && *th == h) {
+                *slot = Some((
+                    w,
+                    h,
+                    renderer.engine.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("corsetta offscreen present"),
+                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        // COPY_SRC so a soak's scripted screenshots can still read it.
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    }),
+                ));
+            }
+            let (_, _, tex) = slot.as_ref().expect("just populated");
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            // corsetta patch — timed on both `present` paths (this offscreen one and
+            // the surface one below), see `iced_core::ui_timing`.
+            let submit_t0 = std::time::Instant::now();
+            let _submission =
+                renderer.present(Some(background_color), format, &view, viewport);
+            crate::core::ui_timing::record_submit_ms(submit_t0.elapsed().as_secs_f32() * 1e3);
+        });
+        // Same call sequence as the real path, so a frame-pacing hook that depends on
+        // it does not silently change behaviour between the two.
+        on_pre_present();
+        // Neither span happened. Reporting the previous frame's would be a lie that
+        // looks exactly like a healthy present.
+        crate::present_timer::record(0.0, 0.0);
+        return Ok(());
+    }
+
+    // Both blocking calls are timed (patch, see [`crate::present_timer`]): an
+    // embedder cannot see either, so without these its "present/idle" is a residual
+    // that absorbs every span it forgot and reports the total as a vsync wait.
+    let acquire_t0 = std::time::Instant::now();
+    let acquired = surface.get_current_texture();
+    let acquire_ms = acquire_t0.elapsed().as_secs_f32() * 1e3;
+
+    match acquired {
         wgpu::CurrentSurfaceTexture::Success(frame) => {
             let view = &frame
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
 
+            // corsetta patch — raw wall time, see `iced_core::ui_timing`.
+            let submit_t0 = std::time::Instant::now();
             let _submission = renderer.present(
                 Some(background_color),
                 frame.texture.format(),
                 view,
                 viewport,
             );
+            crate::core::ui_timing::record_submit_ms(submit_t0.elapsed().as_secs_f32() * 1e3);
 
             // Present the frame
+            let present_t0 = std::time::Instant::now();
             on_pre_present();
             frame.present();
+            crate::present_timer::record(acquire_ms, present_t0.elapsed().as_secs_f32() * 1e3);
 
             Ok(())
         }
-        wgpu::CurrentSurfaceTexture::Suboptimal(_) | wgpu::CurrentSurfaceTexture::Outdated => {
-            Err(compositor::SurfaceError::Outdated)
+        // Nothing was presented, so the acquire still cost what it cost but the
+        // present span is zero — leaving the previous frame's would re-report it.
+        failed => {
+            crate::present_timer::record_no_frame(acquire_ms);
+            Err(match failed {
+                wgpu::CurrentSurfaceTexture::Suboptimal(_)
+                | wgpu::CurrentSurfaceTexture::Outdated => compositor::SurfaceError::Outdated,
+                wgpu::CurrentSurfaceTexture::Timeout => compositor::SurfaceError::Timeout,
+                wgpu::CurrentSurfaceTexture::Occluded => compositor::SurfaceError::Occluded,
+                wgpu::CurrentSurfaceTexture::Lost => compositor::SurfaceError::Lost,
+                _ => compositor::SurfaceError::Other,
+            })
         }
-        wgpu::CurrentSurfaceTexture::Timeout => Err(compositor::SurfaceError::Timeout),
-        wgpu::CurrentSurfaceTexture::Occluded => Err(compositor::SurfaceError::Occluded),
-        wgpu::CurrentSurfaceTexture::Lost => Err(compositor::SurfaceError::Lost),
-        wgpu::CurrentSurfaceTexture::Validation => Err(compositor::SurfaceError::Other),
     }
 }
 

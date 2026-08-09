@@ -36,6 +36,9 @@ pub mod text;
 pub mod theme;
 pub mod time;
 pub mod touch;
+// corsetta patch — raw per-frame CPU timing of `interface.update`/`draw` (iced_winit)
+// and `Renderer::present` (iced_wgpu), read by both so it lives where both can see it.
+pub mod ui_timing;
 pub mod widget;
 pub mod window;
 

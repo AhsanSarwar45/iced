@@ -439,6 +439,21 @@ where
     }
 }
 
+thread_local! {
+    /// When the previous redraw finished, so the next one can measure the gap it
+    /// spent outside its own work. See `frame_pacing::record_loop_wait_ms`.
+    /// corsetta patch.
+    static LAST_REDRAW_END: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+
+    /// When the current redraw began. `redraw_ms + loop_wait_ms` is the whole
+    /// wall-clock period between two redraws, with no gap between them, so a
+    /// frame time that exceeds their sum is a clock mismatch, not a missing
+    /// span. corsetta patch.
+    static REDRAW_START: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug)]
 enum Event<Message: 'static> {
     WindowCreated {
@@ -760,6 +775,18 @@ async fn run_instance<P>(
                             continue;
                         }
 
+                        // corsetta patch — how long the loop was away. Measured
+                        // here, at the first instruction of the redraw, so it covers
+                        // the event-loop wait and the OS pump that precede it.
+                        LAST_REDRAW_END.with(|c| {
+                            if let Some(end) = c.get() {
+                                crate::core::frame_pacing::record_loop_wait_ms(
+                                    end.elapsed().as_secs_f32() * 1e3,
+                                );
+                            }
+                        });
+                        REDRAW_START.with(|c| c.set(Some(Instant::now())));
+
                         // corsetta patch — THE FPS cap. A single gate, synchronous
                         // with the present, at the one point EVERY redraw funnels
                         // through: sleep/spin until this frame's deadline before doing
@@ -796,11 +823,25 @@ async fn run_instance<P>(
                                         std::hint::spin_loop();
                                     }
                                 }
+                                // The ACTUAL pause, not the intended one. `sleep`
+                                // guarantees a floor, never a ceiling: under load the
+                                // OS returns late, and timing the request instead of
+                                // the wait leaves that overshoot invisible — which
+                                // reads downstream as unaccounted frame time.
+                                crate::core::frame_pacing::record_paced_ms(
+                                    now.elapsed().as_secs_f32() * 1e3,
+                                );
                                 window.paced_at = Some(deadline);
                             } else {
+                                // Uncapped: nothing paced us, and a stale reading
+                                // would keep being reported as if it had.
+                                crate::core::frame_pacing::record_paced_ms(0.0);
                                 window.paced_at = None;
                             }
                         } else {
+                            // Compositor-paced: the wait happens in the swapchain,
+                            // where `present_timer`'s acquire span already sees it.
+                            crate::core::frame_pacing::record_paced_ms(0.0);
                             window.paced_at = None;
                         }
 
@@ -835,9 +876,16 @@ async fn run_instance<P>(
 
                         let interact_span = debug::interact(id);
                         let mut redraw_count = 0;
+                        // corsetta patch — summed across this frame's redraw-loop
+                        // iterations (it can run more than once on layout
+                        // invalidation), then published once below. Raw, no
+                        // smoothing — see `iced_core::ui_timing`.
+                        let mut events_ms_total = 0.0f32;
+                        let mut program_ms_total = 0.0f32;
 
                         let state = loop {
                             let message_count = messages.len();
+                            let update_t0 = Instant::now();
                             let (state, _) = interface.update(
                                 &window.raw,
                                 &window.waker,
@@ -846,6 +894,7 @@ async fn run_instance<P>(
                                 &mut window.renderer,
                                 &mut messages,
                             );
+                            events_ms_total += update_t0.elapsed().as_secs_f32() * 1e3;
 
                             if message_count == messages.len() && !state.has_layout_changed() {
                                 break state;
@@ -863,6 +912,11 @@ async fn run_instance<P>(
                             redraw_count += 1;
 
                             if !messages.is_empty() {
+                                // corsetta patch — the message round: cache the
+                                // widget trees, run the program's `update`, rebuild
+                                // and re-layout every tree. Runs on any frame that
+                                // produced a message, i.e. every frame with a Tick.
+                                let program_t0 = Instant::now();
                                 let caches: FxHashMap<_, _> =
                                     ManuallyDrop::into_inner(user_interfaces)
                                         .into_iter()
@@ -877,6 +931,8 @@ async fn run_instance<P>(
                                     caches,
                                     &mut proxy,
                                 ));
+                                program_ms_total +=
+                                    program_t0.elapsed().as_secs_f32() * 1e3;
 
                                 for action in actions {
                                     // Defer all window actions to avoid compositor
@@ -943,9 +999,13 @@ async fn run_instance<P>(
                                 interface = user_interfaces.get_mut(&id).unwrap();
                             }
                         };
+                        // corsetta patch — one sample per frame, see `iced_core::ui_timing`.
+                        crate::core::ui_timing::record_events_ms(events_ms_total);
+                        crate::core::ui_timing::record_program_ms(program_ms_total);
                         interact_span.finish();
 
                         let draw_span = debug::draw(id);
+                        let draw_t0 = Instant::now();
                         interface.draw(
                             &mut window.renderer,
                             window.state.theme(),
@@ -953,6 +1013,10 @@ async fn run_instance<P>(
                                 text_color: window.state.text_color(),
                             },
                             cursor,
+                        );
+                        // corsetta patch — raw wall time, see `iced_core::ui_timing`.
+                        crate::core::ui_timing::record_draw_ms(
+                            draw_t0.elapsed().as_secs_f32() * 1e3,
                         );
                         draw_span.finish();
 
@@ -1050,6 +1114,18 @@ async fn run_instance<P>(
                                 }
                             },
                         }
+
+                        // corsetta patch — close the redraw span AFTER the
+                        // present, so redraw + loop_wait tile the period.
+                        let redraw_end = Instant::now();
+                        REDRAW_START.with(|c| {
+                            if let Some(start) = c.get() {
+                                crate::core::frame_pacing::record_redraw_ms(
+                                    (redraw_end - start).as_secs_f32() * 1e3,
+                                );
+                            }
+                        });
+                        LAST_REDRAW_END.with(|c| c.set(Some(redraw_end)));
                     }
                     event::Event::WindowEvent {
                         event: window_event,

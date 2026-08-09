@@ -33,6 +33,7 @@ mod buffer;
 mod color;
 mod engine;
 mod frame_timer;
+mod present_timer;
 mod quad;
 mod text;
 mod triangle;
@@ -55,6 +56,19 @@ pub use wgpu;
 
 pub use engine::Engine;
 pub use frame_timer::{last_primitive_gpu_ms, last_ui_gpu_ms};
+pub use present_timer::{last_acquire_ms, last_present_ms};
+pub use window::compositor::{is_offscreen, set_offscreen};
+/// Wall-clock ms the redraw loop was held at the FPS-cap deadline (corsetta patch,
+/// see `iced_core::frame_pacing`). Re-exported here so an embedder reads every
+/// frame-timing span from one place.
+pub use crate::core::frame_pacing::{last_loop_wait_ms, last_paced_ms, last_redraw_ms};
+/// Raw per-frame CPU timing of `interface.update`/`draw` (iced_winit) and
+/// `Renderer::present` (this crate's compositor) — corsetta patch, see
+/// `iced_core::ui_timing`. Re-exported here alongside the other frame-timing spans.
+pub use crate::core::ui_timing::{
+    last_draw_ms, last_encode_ms, last_events_ms, last_program_ms, last_queue_submit_ms,
+    last_submit_ms,
+};
 pub use layer::Layer;
 pub use primitive::Primitive;
 
@@ -264,11 +278,22 @@ impl Renderer {
         frame: &wgpu::TextureView,
         viewport: &Viewport,
     ) -> wgpu::SubmissionIndex {
+        // corsetta patch — split the encode (which runs every widget's `prepare`
+        // and `render`, ours included) from the submit, which blocks on GPU
+        // back-pressure. One is our work, the other is waiting for the queue.
+        let encode_t0 = std::time::Instant::now();
         let encoder = self.draw(clear_color, frame, viewport);
 
         self.staging_belt.finish();
+        let encode_ms = encode_t0.elapsed().as_secs_f32() * 1e3;
+
+        let submit_t0 = std::time::Instant::now();
         let submission = self.engine.queue.submit([encoder.finish()]);
         self.staging_belt.recall();
+        crate::core::ui_timing::record_encode_ms(
+            encode_ms,
+            submit_t0.elapsed().as_secs_f32() * 1e3,
+        );
         submission
     }
 
