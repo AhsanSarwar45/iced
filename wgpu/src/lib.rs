@@ -1097,6 +1097,9 @@ impl renderer::Headless for Renderer {
             // Feature-detected on both sides — `render/gpu_cull.rs::optional_features()`.
             wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
             wgpu::Features::INDIRECT_FIRST_INSTANCE,
+            // FLOAT32_FILTERABLE — the sky's scattering tables build in 32-bit floats and are
+            // read filtered (corsetta docs/sky-system.md#scatter-store). Both devices must.
+            wgpu::Features::FLOAT32_FILTERABLE,
         ] {
             if adapter.features().contains(feature) {
                 headless_features |= feature;
